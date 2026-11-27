@@ -22,14 +22,18 @@ public partial class MainWindow : Window
     private string _writeAttemptedDocumentPath = string.Empty;
     private bool _hasSuccessfulRead;
     private bool _writeAttempted;
+    private bool _pendingPersistenceCheck;
+    private string _pendingPersistencePath = string.Empty;
+    private List<ExecutionSnapshot> _expectedPersistedRows = new();
 
     public MainWindow()
     {
         InitializeComponent();
         ResultsGrid.ItemsSource = _rows;
-        Log("Диагностическая программа 0.2.1 запущена.");
+        Log("Диагностическая программа 0.2.2 запущена.");
         Log("Режим чтения доступен всегда. Тест записи и одного перестроения отдельно защищён подтверждениями и требует тестовую копию.");
-        Log("Программа не вызывает Save КОМПАС. После тестовой записи выполняется ровно один IKompasDocument3D.RebuildDocument().");
+        Log("После SetEmbodimentMarking выполняется ровно один IKompasDocument3D.RebuildDocument(). Save программой не вызывается.");
+        Log("Проверка после перестроения не привязана к индексам: учитывается всё семейство с общей базой и сохранность номеров исполнений.");
     }
 
     private void ReadButton_Click(object sender, RoutedEventArgs e)
@@ -39,6 +43,11 @@ public partial class MainWindow : Window
         _rows.Clear();
         _lastReadDocumentPath = string.Empty;
         _hasSuccessfulRead = false;
+        _pendingPersistenceCheck = false;
+        _pendingPersistencePath = string.Empty;
+        _expectedPersistedRows.Clear();
+        PersistenceCheckBox.IsChecked = false;
+        RefreshPersistenceButtonState();
         NewBaseMarkingBox.Clear();
         ConfirmationPhraseBox.Clear();
         TestCopyCheckBox.IsChecked = false;
@@ -369,7 +378,7 @@ public partial class MainWindow : Window
         }
         if (string.Equals(selected.IsVariant, "True", StringComparison.OrdinalIgnoreCase))
         {
-            MessageBox.Show("Для первого теста варианты геометрии не поддерживаются. Выбери обычное исполнение.", "Тест записи", MessageBoxButton.OK, MessageBoxImage.Warning);
+            MessageBox.Show("Для этого теста варианты геометрии не поддерживаются. Выбери обычное исполнение.", "Тест записи", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
         if (string.Equals(newBaseMarking, selected.BaseMarking, StringComparison.Ordinal))
@@ -383,17 +392,42 @@ public partial class MainWindow : Window
             return;
         }
 
-        string expectedFull = newBaseMarking + selected.ExecutionNumber;
+        string oldBaseMarking = selected.BaseMarking;
+        var beforeRows = _rows.Select(ToSnapshot).ToList();
+        var familyBefore = beforeRows.Where(row => string.Equals(row.BaseMarking, oldBaseMarking, StringComparison.Ordinal)).ToList();
+        if (familyBefore.Count == 0 || !familyBefore.Any(row => string.Equals(row.ExecutionNumber, selected.ExecutionNumber, StringComparison.Ordinal)))
+        {
+            MessageBox.Show("Не удалось определить семейство исполнений с общей базой. Тест записи отменён.", "Тест записи", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+        if (beforeRows.Any(row => !string.Equals(row.BaseMarking, oldBaseMarking, StringComparison.Ordinal) &&
+                                  string.Equals(row.BaseMarking, newBaseMarking, StringComparison.Ordinal)))
+        {
+            MessageBox.Show("В документе уже есть другое семейство с таким базовым обозначением. Для безопасной проверки выбери уникальную новую базу.", "Тест записи", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        // Наблюдение по тесту 0.2.1: после перестроения КОМПАС может переместить строки,
+        // а запись базовой части отражается на всех строках семейства с общей базой.
+        // Поэтому строим ожидаемое состояние всего семейства, сохраняя каждый номер исполнения.
+        var expectedAfterRows = beforeRows.Select(row =>
+            string.Equals(row.BaseMarking, oldBaseMarking, StringComparison.Ordinal)
+                ? row with { BaseMarking = newBaseMarking, FullMarking = newBaseMarking + row.ExecutionNumber }
+                : row).ToList();
+
+        string expectedSelectedFull = newBaseMarking + selected.ExecutionNumber;
+        string familyPreview = string.Join(Environment.NewLine, familyBefore.Select(row =>
+            $"  {row.FullMarking}  →  {newBaseMarking}{row.ExecutionNumber}"));
         string prompt = "СЕЙЧАС БУДЕТ ИЗМЕНЕНО ОБОЗНАЧЕНИЕ В ОТКРЫТОМ ДОКУМЕНТЕ КОМПАС.\n\n" +
                         $"Файл: {_lastReadDocumentPath}\n" +
-                        $"Индекс: {selected.Index}\n" +
-                        $"Было: {selected.FullMarking}\n" +
-                        $"Новая база: {newBaseMarking}\n" +
-                        $"Номер исполнения должен остаться: {selected.ExecutionNumber}\n" +
-                        $"Ожидаемое полное обозначение: {expectedFull}\n\n" +
-                        "Программа вызовет только SetEmbodimentMarking(index, ksVMBaseMarking, newBase). " +
-                        "После SetEmbodimentMarking программа ОДИН РАЗ вызовет IKompasDocument3D.RebuildDocument(), затем повторно подключится и проверит все исполнения. Save НЕ вызывается.\n\n" +
-                        "Перестроение может затронуть документ. Продолжать только на отдельной одноразовой копии!";
+                        $"Выбранная строка: индекс {selected.Index}\n" +
+                        $"Семейство с общей базой '{oldBaseMarking}': {familyBefore.Count} строк(и)\n" +
+                        familyPreview + "\n\n" +
+                        $"Новое базовое обозначение семейства: {newBaseMarking}\n" +
+                        "Номера исполнений всех строк семейства должны сохраниться без изменений.\n" +
+                        $"Для выбранной строки ожидается: {expectedSelectedFull}\n\n" +
+                        "Программа вызовет SetEmbodimentMarking(index, ksVMBaseMarking, newBase), один раз выполнит RebuildDocument и проверит весь набор исполнений без привязки к индексам. Save программой не вызывается.\n\n" +
+                        "Продолжать только на отдельной одноразовой копии! После успешной проверки сохранение и повторное открытие выполняются вручную в КОМПАС.";
 
         if (MessageBox.Show(prompt, "Последнее подтверждение изменения", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) != MessageBoxResult.Yes)
         {
@@ -404,21 +438,17 @@ public partial class MainWindow : Window
         WriteTestButton.IsEnabled = false;
         StatusText.Text = "Выполняется контролируемая запись...";
         Log("============================================================");
-        Log("НАЧАЛО КОНТРОЛИРУЕМОГО ТЕСТА ЗАПИСИ И ОДНОГО ПЕРЕСТРОЕНИЯ. Save не вызывается.");
-
-        // Сохраняем исходное состояние всех строк, чтобы после перестроения
-        // проверить не только выбранное исполнение, но и отсутствие побочных изменений.
-        var beforeRows = _rows.ToDictionary(
-            row => row.Index,
-            row => new ExecutionSnapshot(row.BaseMarking, row.ExecutionNumber, row.FullMarking, row.IsVariant));
-        int selectedIndex = selected.Index;
-        string selectedBaseBefore = selected.BaseMarking;
-        string selectedNumberBefore = selected.ExecutionNumber;
-        string selectedFullBefore = selected.FullMarking;
+        Log("НАЧАЛО ТЕСТА ЗАПИСИ СЕМЕЙСТВА И ОДНОГО ПЕРЕСТРОЕНИЯ. Save не вызывается.");
+        Log($"Выбрана строка: индекс {selected.Index}; Base='{selected.BaseMarking}'; Number='{selected.ExecutionNumber}'; Full='{selected.FullMarking}'.");
+        Log($"В семейство с базой '{oldBaseMarking}' входит строк: {familyBefore.Count}. После перестроения индексы могут измениться.");
+        foreach (var familyRow in familyBefore)
+            Log($"Ожидаемое изменение семейства: '{familyRow.FullMarking}' → '{newBaseMarking}{familyRow.ExecutionNumber}' (номер '{familyRow.ExecutionNumber}' сохраняется).");
 
         bool rebuildSucceeded = false;
         Exception? rebuildException = null;
         bool writeAccepted = false;
+        int selectedIndex = selected.Index;
+        string selectedNumberBefore = selected.ExecutionNumber;
 
         try
         {
@@ -437,10 +467,14 @@ public partial class MainWindow : Window
                 string beforeBase = TryGetMarking(manager, selectedIndex, 1, "База перед записью");
                 string beforeNumber = TryGetMarking(manager, selectedIndex, 2, "Номер перед записью");
                 string beforeFull = TryGetMarking(manager, selectedIndex, -1, "Полное обозначение перед записью");
-
                 Log($"Проверка перед записью: Base='{beforeBase}' | Number='{beforeNumber}' | Full='{beforeFull}'");
-                if (beforeBase != selectedBaseBefore || beforeNumber != selectedNumberBefore || beforeFull != selectedFullBefore)
+                if (beforeBase != selected.BaseMarking || beforeNumber != selected.ExecutionNumber || beforeFull != selected.FullMarking)
                     throw new InvalidOperationException("Данные выбранного исполнения изменились после последнего чтения. Запись отменена — нажми считывание ещё раз.");
+
+                // Также убеждаемся, что список до записи совпадает с таблицей, по содержимому, а не по порядку.
+                var latestRows = ReadSnapshotsWithoutGrid(manager, count.Value);
+                if (!AreMultisetsEqual(beforeRows, latestRows))
+                    throw new InvalidOperationException("Состав исполнений изменился после последнего чтения. Запись отменена — обнови таблицу и повтори тест.");
 
                 Log($"Вызов SetEmbodimentMarking(index={selectedIndex}, MarkingType={BaseMarkingType} / ksVMBaseMarking, Marking='{newBaseMarking}')...");
                 _writeAttempted = true;
@@ -464,7 +498,7 @@ public partial class MainWindow : Window
                     rebuildSucceeded = rebuildResult is not null && Convert.ToBoolean(rebuildResult, CultureInfo.InvariantCulture);
                     Log($"Результат RebuildDocument: {FormatComResult(rebuildResult)}");
                     if (!rebuildSucceeded)
-                        Log("ПРЕДУПРЕЖДЕНИЕ: RebuildDocument вернул FALSE. Всё равно выполняем отдельное повторное чтение, чтобы зафиксировать фактическое состояние.");
+                        Log("ПРЕДУПРЕЖДЕНИЕ: RebuildDocument вернул FALSE. Выполняем повторное чтение только для диагностики.");
                 }
                 catch (Exception ex)
                 {
@@ -476,8 +510,6 @@ public partial class MainWindow : Window
             if (!writeConnected)
                 throw new InvalidOperationException("Не удалось подключиться к активному КОМПАС для записи. Перестроение и повторная проверка не выполнены.");
 
-            // Закрываем предыдущие COM-ссылки и открываем свежие через ROT.
-            // Так мы читаем состояние после перестроения не из старого менеджера.
             Log("--- Повторное подключение к активному документу после RebuildDocument ---");
             _rows.Clear();
             bool verifyConnected = WithActiveManager((document, doc3d, manager, activePath) =>
@@ -491,58 +523,58 @@ public partial class MainWindow : Window
             if (!verifyConnected)
                 throw new InvalidOperationException("Не удалось повторно подключиться к документу после перестроения. Не сохраняй тестовую копию.");
 
-            ExecutionRow? refreshedTarget = _rows.FirstOrDefault(row => row.Index == selectedIndex);
-            if (refreshedTarget is null)
-                throw new InvalidOperationException($"После перестроения не удалось повторно прочитать исполнение с индексом {selectedIndex}. Не сохраняй тестовую копию.");
+            var actualAfterRows = _rows.Select(ToSnapshot).ToList();
+            var actualFamilyRows = actualAfterRows.Where(row => string.Equals(row.BaseMarking, newBaseMarking, StringComparison.Ordinal)).ToList();
+            var expectedFamilyRows = expectedAfterRows.Where(row => string.Equals(row.BaseMarking, newBaseMarking, StringComparison.Ordinal)).ToList();
+            var expectedSelected = new ExecutionSnapshot(newBaseMarking, selectedNumberBefore, expectedSelectedFull, selected.IsVariant);
 
-            bool baseMatches = string.Equals(refreshedTarget.BaseMarking, newBaseMarking, StringComparison.Ordinal);
-            bool numberPreserved = string.Equals(refreshedTarget.ExecutionNumber, selectedNumberBefore, StringComparison.Ordinal);
-            bool fullMatches = string.Equals(refreshedTarget.FullMarking, expectedFull, StringComparison.Ordinal);
+            bool targetFamilyFound = actualFamilyRows.Any(row => row.Equals(expectedSelected));
+            bool baseMatches = targetFamilyFound;
+            bool numberPreserved = AreStringMultisetsEqual(
+                familyBefore.Select(row => row.ExecutionNumber),
+                actualFamilyRows.Select(row => row.ExecutionNumber));
+            bool fullMatches = actualFamilyRows.Any(row => row.Equals(expectedSelected));
+            bool familyCountMatches = actualFamilyRows.Count == expectedFamilyRows.Count;
+            bool rowCountMatches = actualAfterRows.Count == expectedAfterRows.Count;
+            bool allRowsMatchExpected = AreMultisetsEqual(expectedAfterRows, actualAfterRows);
 
-            int unchangedOthers = 0;
-            var collateralChanges = new List<string>();
-            foreach (var oldRow in beforeRows)
+            Log("--- Результат сопоставления семейств без использования индексов ---");
+            Log($"Старое семейство '{oldBaseMarking}': {familyBefore.Count} строк; новое семейство '{newBaseMarking}': {actualFamilyRows.Count} строк.");
+            Log($"Ожидаемые номера семейства: [{string.Join(", ", expectedFamilyRows.Select(row => row.ExecutionNumber))}]");
+            Log($"Фактические номера семейства: [{string.Join(", ", actualFamilyRows.Select(row => row.ExecutionNumber))}]");
+            foreach (var familyRow in actualFamilyRows)
             {
-                if (oldRow.Key == selectedIndex) continue;
-                ExecutionRow? current = _rows.FirstOrDefault(row => row.Index == oldRow.Key);
-                if (current is null)
-                {
-                    collateralChanges.Add($"индекс {oldRow.Key}: строка отсутствует после перестроения");
-                    continue;
-                }
-
-                bool unchanged = string.Equals(current.BaseMarking, oldRow.Value.BaseMarking, StringComparison.Ordinal) &&
-                                 string.Equals(current.ExecutionNumber, oldRow.Value.ExecutionNumber, StringComparison.Ordinal) &&
-                                 string.Equals(current.FullMarking, oldRow.Value.FullMarking, StringComparison.Ordinal) &&
-                                 string.Equals(current.IsVariant, oldRow.Value.IsVariant, StringComparison.Ordinal);
-                if (unchanged) unchangedOthers++;
-                else collateralChanges.Add($"индекс {oldRow.Key}: было '{oldRow.Value.FullMarking}', стало '{current.FullMarking}'");
+                var actualIndex = _rows.FirstOrDefault(row => ToSnapshot(row).Equals(familyRow))?.Index;
+                Log($"После перестроения: индекс {actualIndex?.ToString(CultureInfo.InvariantCulture) ?? "?"}; Base='{familyRow.BaseMarking}' | Number='{familyRow.ExecutionNumber}' | Full='{familyRow.FullMarking}'");
             }
 
+            string multisetDiff = DescribeMultisetDifference(expectedAfterRows, actualAfterRows);
             Log("--- Итоговая проверка после одного RebuildDocument и повторного подключения ---");
-            Log($"Целевое исполнение {selectedIndex}: Base='{refreshedTarget.BaseMarking}' | Number='{refreshedTarget.ExecutionNumber}' | Full='{refreshedTarget.FullMarking}'");
-            Log($"Проверки: BaseMatches={baseMatches}; ExecutionNumberPreserved={numberPreserved}; FullMatches={fullMatches}; RebuildSucceeded={rebuildSucceeded}; UnchangedOtherExecutions={unchangedOthers}/{Math.Max(0, beforeRows.Count - 1)}");
+            Log($"Проверки: TargetFamilyFound={targetFamilyFound}; SelectedBaseMatches={baseMatches}; ExecutionNumbersPreserved={numberPreserved}; SelectedFullMatches={fullMatches}; FamilyCountMatches={familyCountMatches}; RowCountMatches={rowCountMatches}; RebuildSucceeded={rebuildSucceeded}; EntireSetMatchesIgnoringIndex={allRowsMatchExpected}");
 
-            bool othersUnchanged = collateralChanges.Count == 0 && unchangedOthers == Math.Max(0, beforeRows.Count - 1);
-            if (baseMatches && numberPreserved && fullMatches && rebuildSucceeded && othersUnchanged && rebuildException is null)
+            bool verificationPassed = baseMatches && numberPreserved && fullMatches && familyCountMatches && rowCountMatches &&
+                                     allRowsMatchExpected && rebuildSucceeded && rebuildException is null;
+            if (verificationPassed)
             {
-                Log("УСПЕХ: одного RebuildDocument достаточно. Базовая часть изменилась, номер исполнения сохранён, остальные исполнения не затронуты.");
-                Log("Документ остался изменённым в памяти КОМПАС. Save не вызывался. Закрой тестовую копию без сохранения после проверки.");
-                StatusText.Text = "Успех: одного перестроения достаточно — НЕ СОХРАНЯТЬ";
-                MessageBox.Show("Тест пройден! Одного RebuildDocument оказалось достаточно: базовая часть обновилась, номер исполнения сохранился, остальные исполнения не изменились.\n\nПрограмма не сохраняла документ. Закрой тестовую копию без сохранения.",
-                    "Тест перестроения завершён", MessageBoxButton.OK, MessageBoxImage.Information);
+                _pendingPersistenceCheck = true;
+                _pendingPersistencePath = _lastReadDocumentPath;
+                _expectedPersistedRows = expectedAfterRows;
+                PersistenceCheckBox.IsChecked = false;
+                RefreshPersistenceButtonState();
+
+                Log("УСПЕХ: одно RebuildDocument применило новое базовое обозначение ко всему семейству. Все номера исполнений и остальные семейства сохранены; индексы не использовались для сравнения.");
+                Log("Следующий этап: вручную сохрани тестовую копию в КОМПАС, закрой документ, открой тот же файл заново и выполни проверку сохранённого состояния. Программа Save не вызывала.");
+                StatusText.Text = "Перестроение успешно — ожидается проверка сохранения";
+                MessageBox.Show("Тест перестроения пройден!\n\nКОМПАС изменил базовое обозначение семейства, сохранил номера исполнений, а сравнение всего списка подтвердило, что остальные строки не изменились. Порядок/индексы после перестроения не учитывались.\n\nСледующий этап: вручную СОХРАНИ тестовую копию в КОМПАС, закрой этот документ, затем заново открой тот же файл. Программу EmbodimentApiProbe оставь открытой. После повторного открытия отметь флажок в блоке проверки сохранения и нажми кнопку проверки.\n\nПрограмма сама ничего не сохраняет.",
+                    "Перестроение подтверждено", MessageBoxButton.OK, MessageBoxImage.Information);
             }
             else
             {
-                string details = $"BaseMatches={baseMatches}; ExecutionNumberPreserved={numberPreserved}; FullMatches={fullMatches}; RebuildSucceeded={rebuildSucceeded}; UnchangedOtherExecutions={unchangedOthers}. " +
-                                 $"После перестроения: Base='{refreshedTarget.BaseMarking}', Number='{refreshedTarget.ExecutionNumber}', Full='{refreshedTarget.FullMarking}'.";
-                if (collateralChanges.Count > 0)
-                    details += " Побочные изменения: " + string.Join("; ", collateralChanges);
-                if (rebuildException is not null)
-                    details += $" Ошибка RebuildDocument: {rebuildException.Message}";
-                LogError("ИТОГОВАЯ ПРОВЕРКА НЕ ПРОЙДЕНА", new InvalidOperationException(details + " Не сохраняй тестовую копию; закрой её без сохранения."));
-                StatusText.Text = "Проверка не пройдена — НЕ СОХРАНЯТЬ документ";
-                MessageBox.Show("Проверка после одного перестроения не пройдена полностью. НЕ СОХРАНЯЙ документ; закрой тестовую копию без сохранения.\n\n" + details,
+                string details = $"TargetFamilyFound={targetFamilyFound}; ExecutionNumbersPreserved={numberPreserved}; SelectedFullMatches={fullMatches}; FamilyCountMatches={familyCountMatches}; RowCountMatches={rowCountMatches}; RebuildSucceeded={rebuildSucceeded}; EntireSetMatchesIgnoringIndex={allRowsMatchExpected}.\n" + multisetDiff;
+                if (rebuildException is not null) details += $"\nОшибка RebuildDocument: {rebuildException.Message}";
+                LogError("ПРОВЕРКА ПОСЛЕ ПЕРЕСТРОЕНИЯ НЕ ПРОЙДЕНА", new InvalidOperationException(details + " Не сохраняй тестовую копию; закрой её без сохранения."));
+                StatusText.Text = "Проверка не пройдена — НЕ СОХРАНЯТЬ";
+                MessageBox.Show("Проверка после перестроения не пройдена полностью. НЕ СОХРАНЯЙ документ; закрой тестовую копию без сохранения.\n\n" + details,
                     "Тест перестроения", MessageBoxButton.OK, MessageBoxImage.Warning);
             }
         }
@@ -559,6 +591,141 @@ public partial class MainWindow : Window
         }
     }
 
+    private void PersistenceCheckBox_Changed(object sender, RoutedEventArgs e) => RefreshPersistenceButtonState();
+
+    private void RefreshPersistenceButtonState()
+    {
+        if (VerifyPersistenceButton is null || PersistenceCheckBox is null) return;
+        VerifyPersistenceButton.IsEnabled = _pendingPersistenceCheck && PersistenceCheckBox.IsChecked == true;
+    }
+
+    private void VerifyPersistenceButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_pendingPersistenceCheck || string.IsNullOrWhiteSpace(_pendingPersistencePath) || _expectedPersistedRows.Count == 0)
+        {
+            MessageBox.Show("Нет ожидающего результата теста для проверки сохранения. Сначала успешно выполни тест записи и перестроения.",
+                "Проверка сохранения", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+        if (PersistenceCheckBox.IsChecked != true)
+        {
+            MessageBox.Show("Подтверди, что ты вручную сохранил тестовую копию в КОМПАС, закрыл документ и заново открыл тот же файл.",
+                "Проверка сохранения", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        VerifyPersistenceButton.IsEnabled = false;
+        StatusText.Text = "Проверка повторно открытого файла...";
+        Log("============================================================");
+        Log("НАЧАЛО ПРОВЕРКИ ПОСЛЕ РУЧНОГО СОХРАНЕНИЯ, ЗАКРЫТИЯ И ПОВТОРНОГО ОТКРЫТИЯ.");
+        Log("Программа не вызывает Save, Close или Open. Проверяется только активный документ.");
+        _rows.Clear();
+
+        try
+        {
+            bool connected = WithActiveManager((document, doc3d, manager, activePath) =>
+            {
+                if (!PathsEqual(activePath, _pendingPersistencePath))
+                    throw new InvalidOperationException($"Открыт другой документ. Ожидался: '{_pendingPersistencePath}', активен: '{activePath}'. Открой именно сохранённую тестовую копию.");
+                Log("Путь совпадает с документом, в котором проводился тест. Считываем исполнения повторно.");
+                ReadManager(manager);
+            });
+
+            if (!connected)
+                throw new InvalidOperationException("Не удалось подключиться к повторно открытому документу.");
+
+            var actual = _rows.Select(ToSnapshot).ToList();
+            bool persistedStateMatches = AreMultisetsEqual(_expectedPersistedRows, actual);
+            string diff = DescribeMultisetDifference(_expectedPersistedRows, actual);
+            Log($"Проверка сохранённого состояния: PersistedStateMatches={persistedStateMatches}; ExpectedRows={_expectedPersistedRows.Count}; ActualRows={actual.Count}.");
+
+            if (persistedStateMatches)
+            {
+                _pendingPersistenceCheck = false;
+                Log("УСПЕХ: после ручного сохранения, закрытия и повторного открытия все базовые обозначения, номера исполнений и остальные строки совпали с ожидаемым состоянием.");
+                StatusText.Text = "СОХРАНЕНИЕ ПОДТВЕРЖДЕНО";
+                MessageBox.Show("Отлично! Сохранение подтверждено. После закрытия и повторного открытия документа всё семейство осталось в ожидаемом состоянии, номера исполнений на месте, остальные строки совпадают.",
+                    "Сохранение подтверждено", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+            else
+            {
+                LogError("СОХРАНЁННОЕ СОСТОЯНИЕ НЕ СОВПАЛО", new InvalidOperationException(diff));
+                StatusText.Text = "Сохранённое состояние отличается — см. лог";
+                MessageBox.Show("После повторного открытия состав обозначений отличается от ожидаемого. Не используй этот файл как доказательство корректности; сохрани лог и отправь его мне.\n\n" + diff,
+                    "Проверка сохранения", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+        }
+        catch (Exception ex)
+        {
+            LogError("Проверка после повторного открытия прервана", ex);
+            StatusText.Text = "Ошибка проверки сохранения — см. лог";
+            MessageBox.Show("Не удалось завершить проверку повторно открытого файла. Сохрани лог и отправь его мне.\n\n" + ex.Message,
+                "Проверка сохранения", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            RefreshPersistenceButtonState();
+        }
+    }
+
+    private List<ExecutionSnapshot> ReadSnapshotsWithoutGrid(object manager, int count)
+    {
+        var snapshots = new List<ExecutionSnapshot>();
+        for (int index = 0; index < count; index++)
+        {
+            string baseMark = TryGetMarking(manager, index, 1, "Базовая часть при повторной проверке перед записью");
+            string number = TryGetMarking(manager, index, 2, "Номер при повторной проверке перед записью");
+            string full = TryGetMarking(manager, index, -1, "Полное обозначение при повторной проверке перед записью");
+            string variant = TryGetVariant(manager, index);
+            if (baseMark == "<ошибка>" || number == "<ошибка>" || full == "<ошибка>" || variant == "<ошибка>")
+                throw new InvalidOperationException($"Не удалось заново прочитать строку исполнения с индексом {index}. Запись отменена.");
+            snapshots.Add(new ExecutionSnapshot(baseMark, number, full, variant));
+        }
+        return snapshots;
+    }
+
+    private static ExecutionSnapshot ToSnapshot(ExecutionRow row)
+        => new(row.BaseMarking, row.ExecutionNumber, row.FullMarking, row.IsVariant);
+
+    private static Dictionary<ExecutionSnapshot, int> ToMultiset(IEnumerable<ExecutionSnapshot> rows)
+    {
+        var result = new Dictionary<ExecutionSnapshot, int>();
+        foreach (var row in rows)
+        {
+            result.TryGetValue(row, out int count);
+            result[row] = count + 1;
+        }
+        return result;
+    }
+
+    private static bool AreMultisetsEqual(IEnumerable<ExecutionSnapshot> expected, IEnumerable<ExecutionSnapshot> actual)
+    {
+        var left = ToMultiset(expected);
+        var right = ToMultiset(actual);
+        return left.Count == right.Count && left.All(pair => right.TryGetValue(pair.Key, out int count) && count == pair.Value);
+    }
+
+    private static bool AreStringMultisetsEqual(IEnumerable<string> expected, IEnumerable<string> actual)
+    {
+        var left = expected.GroupBy(value => value, StringComparer.Ordinal).ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal);
+        var right = actual.GroupBy(value => value, StringComparer.Ordinal).ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal);
+        return left.Count == right.Count && left.All(pair => right.TryGetValue(pair.Key, out int count) && count == pair.Value);
+    }
+
+    private static string DescribeMultisetDifference(IEnumerable<ExecutionSnapshot> expected, IEnumerable<ExecutionSnapshot> actual)
+    {
+        var left = ToMultiset(expected);
+        var right = ToMultiset(actual);
+        var lines = new List<string>();
+        foreach (var item in left.Keys.Union(right.Keys))
+        {
+            left.TryGetValue(item, out int expectedCount);
+            right.TryGetValue(item, out int actualCount);
+            if (expectedCount != actualCount)
+                lines.Add($"'{item.FullMarking}' (Base='{item.BaseMarking}', Number='{item.ExecutionNumber}', Variant='{item.IsVariant}'): ожидалось {expectedCount}, фактически {actualCount}");
+        }
+        return lines.Count == 0 ? "Различий по составу строк не обнаружено." : string.Join(Environment.NewLine, lines);
+    }
 
     private static bool PathsEqual(string first, string second)
     {
@@ -623,6 +790,11 @@ public partial class MainWindow : Window
         LogBox.Clear();
         _lastReadDocumentPath = string.Empty;
         _hasSuccessfulRead = false;
+        _pendingPersistenceCheck = false;
+        _pendingPersistencePath = string.Empty;
+        _expectedPersistedRows.Clear();
+        PersistenceCheckBox.IsChecked = false;
+        RefreshPersistenceButtonState();
         NewBaseMarkingBox.Clear();
         ConfirmationPhraseBox.Clear();
         TestCopyCheckBox.IsChecked = false;
