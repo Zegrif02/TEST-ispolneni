@@ -1,0 +1,49 @@
+name: Build EmbodimentApiProbe (portable Windows EXE)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Verify project file exists
+        shell: pwsh
+        run: |
+          $project = 'src/EmbodimentApiProbe/EmbodimentApiProbe.csproj'
+          if (-not (Test-Path $project)) {
+            Write-Error "Project file not found: $project. Repository root contents:"
+            Get-ChildItem -Force
+            exit 1
+          }
+          Write-Host "Found project: $project"
+
+      - name: Publish portable single-file EXE
+        run: dotnet publish src/EmbodimentApiProbe/EmbodimentApiProbe.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=None -p:DebugSymbols=false -o publish
+
+      - name: Verify EXE was created
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'publish/EmbodimentApiProbe.exe')) {
+            Write-Error 'Publish succeeded but EmbodimentApiProbe.exe was not found.'
+            Get-ChildItem -Recurse publish
+            exit 1
+          }
+          Get-Item 'publish/EmbodimentApiProbe.exe' | Format-List Name, Length, FullName
+
+      - name: Upload portable EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: EmbodimentApiProbe-win-x64
+          path: publish/EmbodimentApiProbe.exe
+          if-no-files-found: error
