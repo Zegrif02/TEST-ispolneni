@@ -1,0 +1,37 @@
+<Window x:Class="EmbodimentApiProbe.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Диагностика исполнений КОМПАС-3D" Height="760" Width="1120"
+        MinHeight="600" MinWidth="900" WindowStartupLocation="CenterScreen">
+    <Grid Margin="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="2*"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <TextBlock Grid.Row="0" FontSize="20" FontWeight="Bold" Text="Тест API исполнений КОМПАС-3D v25" Margin="0,0,0,8"/>
+        <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,10">
+            <Button x:Name="ReadButton" Content="Подключиться и считать исполнения" Padding="14,8" Click="ReadButton_Click"/>
+            <Button x:Name="SaveLogButton" Content="Сохранить лог" Padding="14,8" Margin="8,0,0,0" Click="SaveLogButton_Click"/>
+            <Button x:Name="ClearButton" Content="Очистить" Padding="14,8" Margin="8,0,0,0" Click="ClearButton_Click"/>
+            <TextBlock x:Name="StatusText" VerticalAlignment="Center" Margin="18,0,0,0" Text="Ожидание"/>
+        </StackPanel>
+        <DataGrid Grid.Row="2" x:Name="ResultsGrid" AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False" Margin="0,0,0,10">
+            <DataGrid.Columns>
+                <DataGridTextColumn Header="Индекс API" Binding="{Binding Index}" Width="90"/>
+                <DataGridTextColumn Header="Базовая часть" Binding="{Binding BaseMarking}" Width="*"/>
+                <DataGridTextColumn Header="Номер исполнения" Binding="{Binding ExecutionNumber}" Width="160"/>
+                <DataGridTextColumn Header="Полное обозначение" Binding="{Binding FullMarking}" Width="*"/>
+                <DataGridTextColumn Header="Вариант геометрии" Binding="{Binding IsVariant}" Width="160"/>
+            </DataGrid.Columns>
+        </DataGrid>
+        <GroupBox Grid.Row="3" Header="Диагностический журнал" Margin="0,0,0,8">
+            <TextBox x:Name="LogBox" IsReadOnly="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" FontFamily="Consolas" FontSize="12" Padding="6"/>
+        </GroupBox>
+        <TextBlock Grid.Row="4" Foreground="DarkRed" FontWeight="SemiBold" TextWrapping="Wrap">
+            РЕЖИМ ТОЛЬКО ЧТЕНИЕ: программа не меняет обозначения, исполнения, геометрию и не сохраняет документы КОМПАС.
+        </TextBlock>
+    </Grid>
+</Window>
