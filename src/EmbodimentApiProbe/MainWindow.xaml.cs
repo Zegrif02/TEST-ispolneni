@@ -1,6 +1,7 @@
 using Microsoft.Win32;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.ComTypes;
 using System.Text;
@@ -110,10 +111,10 @@ public partial class MainWindow : Window
             }
 
             docPtr = Marshal.GetIUnknownForObject(document);
-            if (Marshal.QueryInterface(docPtr, ref document3dIid, out doc3dPtr) < 0 || doc3dPtr == IntPtr.Zero)
+            if (Marshal.QueryInterface(docPtr, in document3dIid, out doc3dPtr) < 0 || doc3dPtr == IntPtr.Zero)
             {
                 Log("QueryInterface IKompasDocument3D не выполнен. Пробуем QueryInterface IEmbodimentsManager напрямую от ActiveDocument...");
-                if (Marshal.QueryInterface(docPtr, ref managerIid, out managerPtr) < 0 || managerPtr == IntPtr.Zero)
+                if (Marshal.QueryInterface(docPtr, in managerIid, out managerPtr) < 0 || managerPtr == IntPtr.Zero)
                 {
                     Log("Не удалось получить IEmbodimentsManager от ActiveDocument.");
                     return;
@@ -124,10 +125,10 @@ public partial class MainWindow : Window
                 doc3d = Marshal.GetObjectForIUnknown(doc3dPtr);
                 Log("Интерфейс IKompasDocument3D получен через QueryInterface.");
                 var basePtr = doc3dPtr;
-                if (Marshal.QueryInterface(basePtr, ref managerIid, out managerPtr) < 0 || managerPtr == IntPtr.Zero)
+                if (Marshal.QueryInterface(basePtr, in managerIid, out managerPtr) < 0 || managerPtr == IntPtr.Zero)
                 {
                     Log("QueryInterface IEmbodimentsManager от IKompasDocument3D не выполнен. Пробуем ActiveDocument...");
-                    if (Marshal.QueryInterface(docPtr, ref managerIid, out managerPtr) < 0 || managerPtr == IntPtr.Zero)
+                    if (Marshal.QueryInterface(docPtr, in managerIid, out managerPtr) < 0 || managerPtr == IntPtr.Zero)
                     {
                         Log("Не удалось получить IEmbodimentsManager ни от IKompasDocument3D, ни от ActiveDocument.");
                         return;
