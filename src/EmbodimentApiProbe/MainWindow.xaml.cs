@@ -1,7 +1,7 @@
 using Microsoft.Win32;
 using System.Collections.ObjectModel;
-using System.Diagnostics;
 using System.IO;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.ComTypes;
 using System.Text;
@@ -397,7 +397,7 @@ internal static class TypeLibInterfaceCatalog
 
         try
         {
-            typeLib = LoadRegisteredTypeLibrary(typeLibId);
+            typeLib = LoadRegisteredTypeLibrary(typeLibId, report);
             int count = typeLib.GetTypeInfoCount();
             report.AppendLine($"TypeLib {typeLibId}: найдено typeinfo={count}.");
 
@@ -443,39 +443,108 @@ internal static class TypeLibInterfaceCatalog
         return new Result(ids, report.ToString());
     }
 
-    private static ITypeLib LoadRegisteredTypeLibrary(Guid typeLibId)
+    private static ITypeLib LoadRegisteredTypeLibrary(Guid typeLibId, StringBuilder report)
     {
-        // Сначала пробуем загрузить TypeLib из зарегистрированного пути в реестре.
         string root = $@"TypeLib\{{{typeLibId}}}";
         using var key = Registry.ClassesRoot.OpenSubKey(root);
-        if (key is null) throw new InvalidOperationException($"В реестре отсутствует {root}.");
-
-        foreach (string version in key.GetSubKeyNames().OrderByDescending(s => s, StringComparer.OrdinalIgnoreCase))
+        if (key is null)
         {
-            using var versionKey = key.OpenSubKey(version);
+            report.AppendLine($"В реестре отсутствует раздел {root}.");
+            throw new InvalidOperationException($"В реестре отсутствует {root}.");
+        }
+
+        // Сначала используем зарегистрированную TypeLib по GUID. На некоторых
+        // установках KOMPAS файл kAPI7.tlb существует, но LoadTypeLibEx для него
+        // возвращает TYPE_E_CANTLOADLIBRARY; зарегистрированная запись при этом
+        // может успешно открываться через LoadRegTypeLib.
+        var versions = key.GetSubKeyNames()
+            .Select(name => (Name: name, Parsed: Version.TryParse(name, out var v) ? v : null))
+            .Where(item => item.Parsed is not null)
+            .OrderByDescending(item => item.Parsed)
+            .ToList();
+
+        foreach (var version in versions)
+        {
+            if (version.Parsed!.Major < 0 || version.Parsed.Major > ushort.MaxValue ||
+                version.Parsed.Minor < 0 || version.Parsed.Minor > ushort.MaxValue)
+                continue;
+
+            using var versionKey = key.OpenSubKey(version.Name);
             if (versionKey is null) continue;
+
+            var localeNames = versionKey.GetSubKeyNames();
+            var localeIds = new HashSet<int> { 0 };
+            foreach (string localeName in localeNames)
+            {
+                if (int.TryParse(localeName, NumberStyles.Integer, CultureInfo.InvariantCulture, out int decimalLcid))
+                    localeIds.Add(decimalLcid);
+                if (int.TryParse(localeName, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out int hexLcid))
+                    localeIds.Add(hexLcid);
+            }
+
+            foreach (int lcid in localeIds)
+            {
+                try
+                {
+                    Guid id = typeLibId;
+                    NativeTypeLib.LoadRegTypeLib(
+                        ref id,
+                        (ushort)version.Parsed.Major,
+                        (ushort)version.Parsed.Minor,
+                        lcid,
+                        out ITypeLib registered);
+                    report.AppendLine($"LoadRegTypeLib успешно: версия {version.Name}, LCID={lcid}.");
+                    return registered;
+                }
+                catch (Exception ex)
+                {
+                    report.AppendLine($"LoadRegTypeLib: версия {version.Name}, LCID={lcid}: HRESULT=0x{ex.HResult:X8}; {ex.Message}");
+                }
+            }
+        }
+
+        // Если загрузка по регистрации не сработала, перебираем физические
+        // пути из реестра. Ошибка одного пути не должна блокировать остальные.
+        foreach (var version in versions)
+        {
+            using var versionKey = key.OpenSubKey(version.Name);
+            if (versionKey is null) continue;
+
             foreach (string locale in versionKey.GetSubKeyNames())
             {
                 using var localeKey = versionKey.OpenSubKey(locale);
                 if (localeKey is null) continue;
+
                 foreach (string platform in new[] { "win64", "win32" })
                 {
                     using var platformKey = localeKey.OpenSubKey(platform);
                     string? path = platformKey?.GetValue(null) as string;
                     if (string.IsNullOrWhiteSpace(path)) continue;
-                    path = Environment.ExpandEnvironmentVariables(path.Trim('"'));
-                    if (File.Exists(path))
+
+                    path = Environment.ExpandEnvironmentVariables(path.Trim().Trim('"'));
+                    if (!File.Exists(path))
+                    {
+                        report.AppendLine($"TypeLib-файл не найден ({platform}): {path}");
+                        continue;
+                    }
+
+                    try
                     {
                         NativeTypeLib.LoadTypeLibEx(path, RegKind.None, out ITypeLib loaded);
+                        report.AppendLine($"LoadTypeLibEx успешно: {path}");
                         return loaded;
+                    }
+                    catch (Exception ex)
+                    {
+                        report.AppendLine($"LoadTypeLibEx не удался: {path}; HRESULT=0x{ex.HResult:X8}; {ex.Message}");
                     }
                 }
             }
         }
 
-        // Если typelib зарегистрирована как встроенная/без файла, пробуем LoadRegTypeLib.
-        NativeTypeLib.LoadRegTypeLib(ref typeLibId, 1, 0, 0, out ITypeLib result);
-        return result;
+        throw new InvalidOperationException(
+            "Не удалось загрузить TypeLib API7 ни через LoadRegTypeLib, ни из файлов, указанных в реестре. " +
+            "Подробности попыток приведены выше в журнале.");
     }
 
     private enum RegKind
