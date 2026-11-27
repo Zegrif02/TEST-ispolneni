@@ -27,9 +27,9 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         ResultsGrid.ItemsSource = _rows;
-        Log("Диагностическая программа 0.2.0 запущена.");
-        Log("Режим чтения доступен всегда. Тест записи отдельно защищён подтверждениями и требует тестовую копию.");
-        Log("Программа не вызывает Update и Save КОМПАС.");
+        Log("Диагностическая программа 0.2.1 запущена.");
+        Log("Режим чтения доступен всегда. Тест записи и одного перестроения отдельно защищён подтверждениями и требует тестовую копию.");
+        Log("Программа не вызывает Save КОМПАС. После тестовой записи выполняется ровно один IKompasDocument3D.RebuildDocument().");
     }
 
     private void ReadButton_Click(object sender, RoutedEventArgs e)
@@ -48,7 +48,7 @@ public partial class MainWindow : Window
 
         try
         {
-            bool connected = WithActiveManager((document, manager, documentPath) =>
+            bool connected = WithActiveManager((document, doc3d, manager, documentPath) =>
             {
                 if (!PathsEqual(documentPath, _writeAttemptedDocumentPath))
                     _writeAttempted = false;
@@ -76,7 +76,7 @@ public partial class MainWindow : Window
     /// Подключается только к уже запущенному КОМПАС, получает активный документ и IEmbodimentsManager.
     /// Все COM-вызовы выполняются в UI STA-потоке.
     /// </summary>
-    private bool WithActiveManager(Action<object, object, string> action)
+    private bool WithActiveManager(Action<object, object?, object, string> action)
     {
         object? app = null;
         object? document = null;
@@ -145,7 +145,7 @@ public partial class MainWindow : Window
                 throw new InvalidOperationException("Не удалось получить IEmbodimentsManager от активного документа.");
 
             manager = Marshal.GetObjectForIUnknown(managerPtr);
-            action(document, manager, documentPath);
+            action(document, doc3d, manager, documentPath);
             return true;
         }
         finally
@@ -180,8 +180,8 @@ public partial class MainWindow : Window
         int? count = TryReadCount(manager);
         Log($"Количество исполнений: {(count.HasValue ? count.Value.ToString(CultureInfo.InvariantCulture) : "не удалось получить")}");
 
-        TryInvokeAndLog(manager, "GetEmbodimentsTree", "Дерево исполнений", Array.Empty<object>());
-        TryInvokeAndLog(manager, "GetCurrentEmbodimentIndex", "Индекс текущего исполнения", Array.Empty<object>());
+        // Два необязательных метода GetEmbodimentsTree и GetCurrentEmbodimentIndex
+        // намеренно не вызываются: их COM-сигнатуры/параметры не нужны для проверки записи.
         TryInvokeAndLog(manager, "GetCurrentEmbodimentMarking", "Обозначение текущего исполнения (полное)", new object[] { -1, false });
 
         if (!count.HasValue || count.Value <= 0)
@@ -392,8 +392,8 @@ public partial class MainWindow : Window
                         $"Номер исполнения должен остаться: {selected.ExecutionNumber}\n" +
                         $"Ожидаемое полное обозначение: {expectedFull}\n\n" +
                         "Программа вызовет только SetEmbodimentMarking(index, ksVMBaseMarking, newBase). " +
-                        "Она НЕ будет перестраивать и НЕ будет сохранять документ.\n\n" +
-                        "Продолжать? Только если это отдельная одноразовая копия!";
+                        "После SetEmbodimentMarking программа ОДИН РАЗ вызовет IKompasDocument3D.RebuildDocument(), затем повторно подключится и проверит все исполнения. Save НЕ вызывается.\n\n" +
+                        "Перестроение может затронуть документ. Продолжать только на отдельной одноразовой копии!";
 
         if (MessageBox.Show(prompt, "Последнее подтверждение изменения", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) != MessageBoxResult.Yes)
         {
@@ -404,84 +404,161 @@ public partial class MainWindow : Window
         WriteTestButton.IsEnabled = false;
         StatusText.Text = "Выполняется контролируемая запись...";
         Log("============================================================");
-        Log("НАЧАЛО КОНТРОЛИРУЕМОГО ТЕСТА ЗАПИСИ. Сохранение и Update не вызываются.");
+        Log("НАЧАЛО КОНТРОЛИРУЕМОГО ТЕСТА ЗАПИСИ И ОДНОГО ПЕРЕСТРОЕНИЯ. Save не вызывается.");
+
+        // Сохраняем исходное состояние всех строк, чтобы после перестроения
+        // проверить не только выбранное исполнение, но и отсутствие побочных изменений.
+        var beforeRows = _rows.ToDictionary(
+            row => row.Index,
+            row => new ExecutionSnapshot(row.BaseMarking, row.ExecutionNumber, row.FullMarking, row.IsVariant));
+        int selectedIndex = selected.Index;
+        string selectedBaseBefore = selected.BaseMarking;
+        string selectedNumberBefore = selected.ExecutionNumber;
+        string selectedFullBefore = selected.FullMarking;
+
+        bool rebuildSucceeded = false;
+        Exception? rebuildException = null;
+        bool writeAccepted = false;
 
         try
         {
-            bool connected = WithActiveManager((document, manager, activePath) =>
+            bool writeConnected = WithActiveManager((document, doc3d, manager, activePath) =>
             {
                 if (!PathsEqual(activePath, _lastReadDocumentPath))
                     throw new InvalidOperationException("Активный документ КОМПАС изменился после чтения. Повторно считай исполнения и проверь выбранную копию.");
 
-                int? count = TryReadCount(manager);
-                if (!count.HasValue || selected.Index < 0 || selected.Index >= count.Value)
-                    throw new InvalidOperationException($"Индекс {selected.Index} больше не входит в диапазон исполнений текущего документа.");
+                if (doc3d is null)
+                    throw new InvalidOperationException("Не получен IKompasDocument3D. Запись отменена, поскольку после неё нельзя безопасно выполнить перестроение документа.");
 
-                string beforeBase = TryGetMarking(manager, selected.Index, 1, "База перед записью");
-                string beforeNumber = TryGetMarking(manager, selected.Index, 2, "Номер перед записью");
-                string beforeFull = TryGetMarking(manager, selected.Index, -1, "Полное обозначение перед записью");
+                int? count = TryReadCount(manager);
+                if (!count.HasValue || selectedIndex < 0 || selectedIndex >= count.Value)
+                    throw new InvalidOperationException($"Индекс {selectedIndex} больше не входит в диапазон исполнений текущего документа.");
+
+                string beforeBase = TryGetMarking(manager, selectedIndex, 1, "База перед записью");
+                string beforeNumber = TryGetMarking(manager, selectedIndex, 2, "Номер перед записью");
+                string beforeFull = TryGetMarking(manager, selectedIndex, -1, "Полное обозначение перед записью");
 
                 Log($"Проверка перед записью: Base='{beforeBase}' | Number='{beforeNumber}' | Full='{beforeFull}'");
-                if (beforeBase != selected.BaseMarking || beforeNumber != selected.ExecutionNumber || beforeFull != selected.FullMarking)
-                    throw new InvalidOperationException("Данные исполнения изменились после последнего чтения. Запись отменена — нажми считывание ещё раз.");
+                if (beforeBase != selectedBaseBefore || beforeNumber != selectedNumberBefore || beforeFull != selectedFullBefore)
+                    throw new InvalidOperationException("Данные выбранного исполнения изменились после последнего чтения. Запись отменена — нажми считывание ещё раз.");
 
-                Log($"Вызов SetEmbodimentMarking(index={selected.Index}, MarkingType={BaseMarkingType} / ksVMBaseMarking, Marking='{newBaseMarking}')...");
+                Log($"Вызов SetEmbodimentMarking(index={selectedIndex}, MarkingType={BaseMarkingType} / ksVMBaseMarking, Marking='{newBaseMarking}')...");
                 _writeAttempted = true;
                 _writeAttemptedDocumentPath = activePath;
                 RefreshWriteButtonState();
-                object? apiResult = ((dynamic)manager).SetEmbodimentMarking(selected.Index, BaseMarkingType, newBaseMarking);
-                bool apiSucceeded = apiResult is not null && Convert.ToBoolean(apiResult, CultureInfo.InvariantCulture);
+                object? apiResult = ((dynamic)manager).SetEmbodimentMarking(selectedIndex, BaseMarkingType, newBaseMarking);
+                writeAccepted = apiResult is not null && Convert.ToBoolean(apiResult, CultureInfo.InvariantCulture);
                 Log($"Результат SetEmbodimentMarking: {FormatComResult(apiResult)}");
-                if (!apiSucceeded)
-                    throw new InvalidOperationException("SetEmbodimentMarking вернул FALSE. Проверь лог и состояние тестовой копии.");
+                if (!writeAccepted)
+                    throw new InvalidOperationException("SetEmbodimentMarking вернул FALSE. Перестроение не выполняется. Закрой тестовую копию без сохранения.");
 
-                string afterBase = TryGetMarking(manager, selected.Index, 1, "База после записи");
-                string afterNumber = TryGetMarking(manager, selected.Index, 2, "Номер после записи");
-                string afterFull = TryGetMarking(manager, selected.Index, -1, "Полное обозначение после записи");
-                Log($"Проверка после записи: Base='{afterBase}' | Number='{afterNumber}' | Full='{afterFull}'");
+                string immediateBase = TryGetMarking(manager, selectedIndex, 1, "База сразу после записи, до перестроения");
+                string immediateNumber = TryGetMarking(manager, selectedIndex, 2, "Номер сразу после записи, до перестроения");
+                string immediateFull = TryGetMarking(manager, selectedIndex, -1, "Полное обозначение сразу после записи, до перестроения");
+                Log($"Снимок до перестроения (может быть неактуальным): Base='{immediateBase}' | Number='{immediateNumber}' | Full='{immediateFull}'");
 
-                bool basePreserved = string.Equals(afterBase, newBaseMarking, StringComparison.Ordinal);
-                bool numberPreserved = string.Equals(afterNumber, beforeNumber, StringComparison.Ordinal);
-                bool fullMatches = string.Equals(afterFull, expectedFull, StringComparison.Ordinal);
-
-                if (basePreserved && numberPreserved && fullMatches)
+                Log("Вызов IKompasDocument3D.RebuildDocument() — ровно один раз. Save не вызывается.");
+                try
                 {
-                    selected.BaseMarking = afterBase;
-                    selected.ExecutionNumber = afterNumber;
-                    selected.FullMarking = afterFull;
-                    ResultsGrid.Items.Refresh();
-                    Log("УСПЕХ: базовая часть изменилась, номер исполнения сохранён, полное обозначение совпало с ожидаемым.");
-                    Log("Документ оставлен изменённым только в памяти КОМПАС. Ничего не перестраивалось и не сохранялось.");
+                    object? rebuildResult = ((dynamic)doc3d).RebuildDocument();
+                    rebuildSucceeded = rebuildResult is not null && Convert.ToBoolean(rebuildResult, CultureInfo.InvariantCulture);
+                    Log($"Результат RebuildDocument: {FormatComResult(rebuildResult)}");
+                    if (!rebuildSucceeded)
+                        Log("ПРЕДУПРЕЖДЕНИЕ: RebuildDocument вернул FALSE. Всё равно выполняем отдельное повторное чтение, чтобы зафиксировать фактическое состояние.");
                 }
-                else
+                catch (Exception ex)
                 {
-                    string details = $"BaseOK={basePreserved}; ExecutionNumberPreserved={numberPreserved}; FullMatches={fullMatches}. " +
-                                     $"Фактически: Base='{afterBase}', Number='{afterNumber}', Full='{afterFull}'.";
-                    LogError("ПРОВЕРКА ПОСЛЕ ЗАПИСИ НЕ ПРОЙДЕНА", new InvalidOperationException(details +
-                        " Не сохраняй этот документ. Закрой тестовую копию без сохранения."));
-                    StatusText.Text = "Проверка не пройдена — НЕ СОХРАНЯТЬ документ";
-                    MessageBox.Show("Проверка после записи не пройдена. НЕ СОХРАНЯЙ документ; закрой тестовую копию без сохранения.\n\n" + details,
-                        "Тест записи: требуется отменить изменения", MessageBoxButton.OK, MessageBoxImage.Error);
+                    rebuildException = ex;
+                    LogError("Вызов IKompasDocument3D.RebuildDocument", ex);
                 }
             });
 
-            if (!connected)
-                StatusText.Text = "Не удалось подключиться — см. журнал";
-            else if (!StatusText.Text.StartsWith("Проверка не пройдена", StringComparison.Ordinal))
-                StatusText.Text = "Тест записи завершён — см. журнал";
+            if (!writeConnected)
+                throw new InvalidOperationException("Не удалось подключиться к активному КОМПАС для записи. Перестроение и повторная проверка не выполнены.");
+
+            // Закрываем предыдущие COM-ссылки и открываем свежие через ROT.
+            // Так мы читаем состояние после перестроения не из старого менеджера.
+            Log("--- Повторное подключение к активному документу после RebuildDocument ---");
+            _rows.Clear();
+            bool verifyConnected = WithActiveManager((document, doc3d, manager, activePath) =>
+            {
+                if (!PathsEqual(activePath, _lastReadDocumentPath))
+                    throw new InvalidOperationException("После перестроения активным стал другой документ. Проверка остановлена.");
+                Log("Свежий IEmbodimentsManager получен. Повторно считываем ВСЕ исполнения.");
+                ReadManager(manager);
+            });
+
+            if (!verifyConnected)
+                throw new InvalidOperationException("Не удалось повторно подключиться к документу после перестроения. Не сохраняй тестовую копию.");
+
+            ExecutionRow? refreshedTarget = _rows.FirstOrDefault(row => row.Index == selectedIndex);
+            if (refreshedTarget is null)
+                throw new InvalidOperationException($"После перестроения не удалось повторно прочитать исполнение с индексом {selectedIndex}. Не сохраняй тестовую копию.");
+
+            bool baseMatches = string.Equals(refreshedTarget.BaseMarking, newBaseMarking, StringComparison.Ordinal);
+            bool numberPreserved = string.Equals(refreshedTarget.ExecutionNumber, selectedNumberBefore, StringComparison.Ordinal);
+            bool fullMatches = string.Equals(refreshedTarget.FullMarking, expectedFull, StringComparison.Ordinal);
+
+            int unchangedOthers = 0;
+            var collateralChanges = new List<string>();
+            foreach (var oldRow in beforeRows)
+            {
+                if (oldRow.Key == selectedIndex) continue;
+                ExecutionRow? current = _rows.FirstOrDefault(row => row.Index == oldRow.Key);
+                if (current is null)
+                {
+                    collateralChanges.Add($"индекс {oldRow.Key}: строка отсутствует после перестроения");
+                    continue;
+                }
+
+                bool unchanged = string.Equals(current.BaseMarking, oldRow.Value.BaseMarking, StringComparison.Ordinal) &&
+                                 string.Equals(current.ExecutionNumber, oldRow.Value.ExecutionNumber, StringComparison.Ordinal) &&
+                                 string.Equals(current.FullMarking, oldRow.Value.FullMarking, StringComparison.Ordinal) &&
+                                 string.Equals(current.IsVariant, oldRow.Value.IsVariant, StringComparison.Ordinal);
+                if (unchanged) unchangedOthers++;
+                else collateralChanges.Add($"индекс {oldRow.Key}: было '{oldRow.Value.FullMarking}', стало '{current.FullMarking}'");
+            }
+
+            Log("--- Итоговая проверка после одного RebuildDocument и повторного подключения ---");
+            Log($"Целевое исполнение {selectedIndex}: Base='{refreshedTarget.BaseMarking}' | Number='{refreshedTarget.ExecutionNumber}' | Full='{refreshedTarget.FullMarking}'");
+            Log($"Проверки: BaseMatches={baseMatches}; ExecutionNumberPreserved={numberPreserved}; FullMatches={fullMatches}; RebuildSucceeded={rebuildSucceeded}; UnchangedOtherExecutions={unchangedOthers}/{Math.Max(0, beforeRows.Count - 1)}");
+
+            bool othersUnchanged = collateralChanges.Count == 0 && unchangedOthers == Math.Max(0, beforeRows.Count - 1);
+            if (baseMatches && numberPreserved && fullMatches && rebuildSucceeded && othersUnchanged && rebuildException is null)
+            {
+                Log("УСПЕХ: одного RebuildDocument достаточно. Базовая часть изменилась, номер исполнения сохранён, остальные исполнения не затронуты.");
+                Log("Документ остался изменённым в памяти КОМПАС. Save не вызывался. Закрой тестовую копию без сохранения после проверки.");
+                StatusText.Text = "Успех: одного перестроения достаточно — НЕ СОХРАНЯТЬ";
+                MessageBox.Show("Тест пройден! Одного RebuildDocument оказалось достаточно: базовая часть обновилась, номер исполнения сохранился, остальные исполнения не изменились.\n\nПрограмма не сохраняла документ. Закрой тестовую копию без сохранения.",
+                    "Тест перестроения завершён", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+            else
+            {
+                string details = $"BaseMatches={baseMatches}; ExecutionNumberPreserved={numberPreserved}; FullMatches={fullMatches}; RebuildSucceeded={rebuildSucceeded}; UnchangedOtherExecutions={unchangedOthers}. " +
+                                 $"После перестроения: Base='{refreshedTarget.BaseMarking}', Number='{refreshedTarget.ExecutionNumber}', Full='{refreshedTarget.FullMarking}'.";
+                if (collateralChanges.Count > 0)
+                    details += " Побочные изменения: " + string.Join("; ", collateralChanges);
+                if (rebuildException is not null)
+                    details += $" Ошибка RebuildDocument: {rebuildException.Message}";
+                LogError("ИТОГОВАЯ ПРОВЕРКА НЕ ПРОЙДЕНА", new InvalidOperationException(details + " Не сохраняй тестовую копию; закрой её без сохранения."));
+                StatusText.Text = "Проверка не пройдена — НЕ СОХРАНЯТЬ документ";
+                MessageBox.Show("Проверка после одного перестроения не пройдена полностью. НЕ СОХРАНЯЙ документ; закрой тестовую копию без сохранения.\n\n" + details,
+                    "Тест перестроения", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
         }
         catch (Exception ex)
         {
-            LogError("Тест записи прерван", ex);
+            LogError("Тест записи/перестроения прерван", ex);
             StatusText.Text = "Тест прерван — не сохраняй тестовую копию";
-            MessageBox.Show("Тест записи не завершился штатно. Не сохраняй тестовую копию. Закрой её без сохранения и отправь мне лог.\n\n" + ex.Message,
-                "Тест записи", MessageBoxButton.OK, MessageBoxImage.Error);
+            MessageBox.Show("Тест не завершился штатно. Не сохраняй тестовую копию. Закрой её без сохранения и отправь мне лог.\n\n" + ex.Message,
+                "Тест записи и перестроения", MessageBoxButton.OK, MessageBoxImage.Error);
         }
         finally
         {
             RefreshWriteButtonState();
         }
     }
+
 
     private static bool PathsEqual(string first, string second)
     {
@@ -559,6 +636,8 @@ public partial class MainWindow : Window
         public static extern int GetActiveObject(ref Guid rclsid, IntPtr pvReserved, out IntPtr ppunk);
     }
 }
+
+internal sealed record ExecutionSnapshot(string BaseMarking, string ExecutionNumber, string FullMarking, string IsVariant);
 
 public sealed class ExecutionRow
 {
