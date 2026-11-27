@@ -1,0 +1,55 @@
+name: Build portable Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Publish self-contained single-file app
+        run: >-
+          dotnet publish src/DesignationEditor2/DesignationEditor2.csproj
+          -c Release
+          -r win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:IncludeAllContentForSelfExtract=true
+          -p:EnableCompressionInSingleFile=true
+          -p:PublishReadyToRun=true
+          -p:PublishTrimmed=false
+          -p:DebugType=None
+          -p:DebugSymbols=false
+          -o publish/win-x64
+
+      - name: Verify executable exists
+        shell: pwsh
+        run: |
+          if (!(Test-Path 'publish/win-x64/DesignationEditor2.exe')) {
+            throw 'EXE was not produced.'
+          }
+          Get-Item 'publish/win-x64/DesignationEditor2.exe' | Format-List Name,Length
+
+      - name: Upload portable EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: DesignationEditor2-portable-win-x64
+          path: publish/win-x64/DesignationEditor2.exe
+          if-no-files-found: error
+          retention-days: 30
